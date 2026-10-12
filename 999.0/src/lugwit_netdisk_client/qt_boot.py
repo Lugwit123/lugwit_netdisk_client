@@ -14,8 +14,9 @@ rez 把 PySide6 拆成三个包（essentials / addons / shiboken6），各自一
 另外 QtWebEngine 的沙箱子进程在 rez 环境下起不来（0xC0000135 找不到 DLL），
 必须加 `--no-sandbox`，否则渲染进程直接 crash、页面白屏。
 
-本模块可单独运行做体检：
-    wuwor lugwit_netdisk_client -- netdisk_client_doctor
+合并结果与是否命中缓存会在启动时打印（`[netdisk_client] PySide6 合并完成: ...`）；
+环境换了 pyside6 版本、或页面白屏怀疑 Qt 环境时，删掉 `rez-package-3rd/.pyside6_merged`
+再启动即可强制重新合并。
 """
 from __future__ import annotations
 
@@ -27,6 +28,30 @@ from pathlib import Path
 _STAMP = "_lugwit_merged.ok"
 _DEFAULT_FLAGS = "--no-sandbox --disable-gpu"
 _READY: "Path | None" = None
+
+# Windows 任务栏 / 通知 / 跳转列表的身份（AppUserModelID）。
+# 不设的话，所有 python.exe 起的窗口都归到同一个任务栏分组、显示 python 图标，
+# 钉到任务栏钉的也是 python；设了才按本应用单独分组、吃自己的图标。
+# 必须在**创建窗口之前**设置，所以放在 qt_boot.setup() 里（早于 PySide6 导入）。
+# 可用 LUGWIT_NETDISK_APP_ID 覆盖。
+APP_ID = os.environ.get("LUGWIT_NETDISK_APP_ID", "").strip() or "Lugwit.NetdiskClient"
+
+
+def set_app_id(app_id: str = "") -> bool:
+    """设置进程的 AppUserModelID（仅 Windows；非 Windows 或不支持时返回 False）。"""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.windll.shell32
+        shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
+        shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_int32
+        # S_OK(0) = 设置成功
+        return shell32.SetCurrentProcessExplicitAppUserModelID(app_id or APP_ID) == 0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _pkg_python_dir(root: str) -> str:
@@ -100,6 +125,7 @@ def merge(force: bool = False) -> Path:
 def setup(force_merge: bool = False) -> Path:
     """必须在 import PySide6 之前调用；重复调用无副作用。"""
     global _READY
+    set_app_id()  # 越早越好：窗口一出现任务栏分组就定死了
     if _READY is not None and not force_merge:
         return _READY
     mod = sys.modules.get("PySide6")
@@ -123,37 +149,3 @@ def setup(force_merge: bool = False) -> Path:
     os.environ.setdefault("QT_API", "pyside6")
     _READY = dst
     return dst
-
-
-def doctor() -> int:
-    """体检：合并 -> 导入 -> 建 view -> 加载一段 HTML。"""
-    dst = setup()
-    print("MERGED_DIR", dst)
-    from PySide6.QtCore import QTimer  # noqa: PLC0415
-    from PySide6.QtWebChannel import QWebChannel  # noqa: F401,PLC0415
-    from PySide6.QtWebEngineWidgets import QWebEngineView  # noqa: PLC0415
-    from PySide6.QtWidgets import QApplication  # noqa: PLC0415
-
-    print("IMPORT_OK  flags =", os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS"))
-    app = QApplication(sys.argv)
-    view = QWebEngineView()
-    state = {"ok": False}
-
-    def done(ok: bool) -> None:
-        state["ok"] = ok
-        print("LOAD_FINISHED", ok, "| TITLE", repr(view.title()))
-        app.quit()
-
-    view.loadFinished.connect(done)
-    view.page().renderProcessTerminated.connect(
-        lambda status, code: print("RENDER_DEAD", status, code)
-    )
-    view.setHtml("<html><head><title>doctor</title></head><body>ok</body></html>")
-    QTimer.singleShot(25000, app.quit)
-    app.exec()
-    print("RESULT", "PASS" if state["ok"] else "FAIL")
-    return 0 if state["ok"] else 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(doctor())
